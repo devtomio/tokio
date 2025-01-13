@@ -1,8 +1,8 @@
-version: 2.1        
+version: 2.1
 jobs:
   test-arm:
     machine:
-      image: ubuntu-2004:202101-01
+      image: default
     resource_class: arm.medium
     environment:
       # Change to pin rust version

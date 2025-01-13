@@ -5,11 +5,10 @@ cfg_not_wasi! {
     use crate::net::{to_socket_addrs, ToSocketAddrs};
 }
 
-use std::convert::TryFrom;
 use std::fmt;
 use std::io;
 use std::net::{self, SocketAddr};
-use std::task::{Context, Poll};
+use std::task::{ready, Context, Poll};
 
 cfg_net! {
     /// A TCP socket server, listening for connections.
@@ -59,7 +58,7 @@ cfg_net! {
 
 impl TcpListener {
     cfg_not_wasi! {
-        /// Creates a new TcpListener, which will be bound to the specified address.
+        /// Creates a new `TcpListener`, which will be bound to the specified address.
         ///
         /// The returned listener is ready for accepting connections.
         ///
@@ -84,6 +83,7 @@ impl TcpListener {
         /// # Examples
         ///
         /// ```no_run
+        /// # if cfg!(miri) { return } // No `socket` in miri.
         /// use tokio::net::TcpListener;
         ///
         /// use std::io;
@@ -195,14 +195,21 @@ impl TcpListener {
     /// Creates new `TcpListener` from a `std::net::TcpListener`.
     ///
     /// This function is intended to be used to wrap a TCP listener from the
-    /// standard library in the Tokio equivalent. The conversion assumes nothing
-    /// about the underlying listener; it is left up to the user to set it in
-    /// non-blocking mode.
+    /// standard library in the Tokio equivalent.
     ///
     /// This API is typically paired with the `socket2` crate and the `Socket`
     /// type to build up and customize a listener before it's shipped off to the
     /// backing event loop. This allows configuration of options like
     /// `SO_REUSEPORT`, binding to multiple addresses, etc.
+    ///
+    /// # Notes
+    ///
+    /// The caller is responsible for ensuring that the listener is in
+    /// non-blocking mode. Otherwise all I/O operations on the listener
+    /// will block the thread, which will cause unexpected behavior.
+    /// Non-blocking mode can be set using [`set_nonblocking`].
+    ///
+    /// [`set_nonblocking`]: std::net::TcpListener::set_nonblocking
     ///
     /// # Examples
     ///
@@ -262,7 +269,7 @@ impl TcpListener {
             use std::os::unix::io::{FromRawFd, IntoRawFd};
             self.io
                 .into_inner()
-                .map(|io| io.into_raw_fd())
+                .map(IntoRawFd::into_raw_fd)
                 .map(|raw_fd| unsafe { std::net::TcpListener::from_raw_fd(raw_fd) })
         }
 
@@ -275,7 +282,7 @@ impl TcpListener {
                 .map(|raw_socket| unsafe { std::net::TcpListener::from_raw_socket(raw_socket) })
         }
 
-        #[cfg(tokio_wasi)]
+        #[cfg(target_os = "wasi")]
         {
             use std::os::wasi::io::{FromRawFd, IntoRawFd};
             self.io
@@ -400,10 +407,16 @@ mod sys {
             self.io.as_raw_fd()
         }
     }
+
+    impl AsFd for TcpListener {
+        fn as_fd(&self) -> BorrowedFd<'_> {
+            unsafe { BorrowedFd::borrow_raw(self.as_raw_fd()) }
+        }
+    }
 }
 
 cfg_unstable! {
-    #[cfg(tokio_wasi)]
+    #[cfg(target_os = "wasi")]
     mod sys {
         use super::TcpListener;
         use std::os::wasi::prelude::*;
@@ -413,17 +426,27 @@ cfg_unstable! {
                 self.io.as_raw_fd()
             }
         }
+
+        impl AsFd for TcpListener {
+            fn as_fd(&self) -> BorrowedFd<'_> {
+                unsafe { BorrowedFd::borrow_raw(self.as_raw_fd()) }
+            }
+        }
     }
 }
 
-#[cfg(windows)]
-mod sys {
-    use super::TcpListener;
-    use std::os::windows::prelude::*;
+cfg_windows! {
+    use crate::os::windows::io::{AsRawSocket, RawSocket, AsSocket, BorrowedSocket};
 
     impl AsRawSocket for TcpListener {
         fn as_raw_socket(&self) -> RawSocket {
             self.io.as_raw_socket()
+        }
+    }
+
+    impl AsSocket for TcpListener {
+        fn as_socket(&self) -> BorrowedSocket<'_> {
+            unsafe { BorrowedSocket::borrow_raw(self.as_raw_socket()) }
         }
     }
 }

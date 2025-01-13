@@ -1,13 +1,18 @@
 use crate::io::{Interest, PollEvented};
 use crate::net::unix::{SocketAddr, UnixStream};
 
-use std::convert::TryFrom;
 use std::fmt;
 use std::io;
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
-use std::os::unix::net;
+#[cfg(target_os = "android")]
+use std::os::android::net::SocketAddrExt;
+#[cfg(target_os = "linux")]
+use std::os::linux::net::SocketAddrExt;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, RawFd};
+use std::os::unix::net::{self, SocketAddr as StdSocketAddr};
 use std::path::Path;
-use std::task::{Context, Poll};
+use std::task::{ready, Context, Poll};
 
 cfg_net_unix! {
     /// A Unix socket which can accept connections from other Unix sockets.
@@ -44,12 +49,18 @@ cfg_net_unix! {
     ///     }
     /// }
     /// ```
+    #[cfg_attr(docsrs, doc(alias = "uds"))]
     pub struct UnixListener {
         io: PollEvented<mio::net::UnixListener>,
     }
 }
 
 impl UnixListener {
+    pub(crate) fn new(listener: mio::net::UnixListener) -> io::Result<UnixListener> {
+        let io = PollEvented::new(listener)?;
+        Ok(UnixListener { io })
+    }
+
     /// Creates a new `UnixListener` bound to the specified path.
     ///
     /// # Panics
@@ -65,17 +76,52 @@ impl UnixListener {
     where
         P: AsRef<Path>,
     {
-        let listener = mio::net::UnixListener::bind(path)?;
+        // For now, we handle abstract socket paths on linux here.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let addr = {
+            let os_str_bytes = path.as_ref().as_os_str().as_bytes();
+            if os_str_bytes.starts_with(b"\0") {
+                StdSocketAddr::from_abstract_name(&os_str_bytes[1..])?
+            } else {
+                StdSocketAddr::from_pathname(path)?
+            }
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let addr = StdSocketAddr::from_pathname(path)?;
+
+        let listener = mio::net::UnixListener::bind_addr(&addr)?;
         let io = PollEvented::new(listener)?;
         Ok(UnixListener { io })
     }
 
-    /// Creates new `UnixListener` from a `std::os::unix::net::UnixListener `.
+    /// Creates new [`UnixListener`] from a [`std::os::unix::net::UnixListener`].
     ///
-    /// This function is intended to be used to wrap a UnixListener from the
-    /// standard library in the Tokio equivalent. The conversion assumes
-    /// nothing about the underlying listener; it is left up to the user to set
-    /// it in non-blocking mode.
+    /// This function is intended to be used to wrap a `UnixListener` from the
+    /// standard library in the Tokio equivalent.
+    ///
+    /// # Notes
+    ///
+    /// The caller is responsible for ensuring that the listener is in
+    /// non-blocking mode. Otherwise all I/O operations on the listener
+    /// will block the thread, which will cause unexpected behavior.
+    /// Non-blocking mode can be set using [`set_nonblocking`].
+    ///
+    /// [`set_nonblocking`]: std::os::unix::net::UnixListener::set_nonblocking
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use tokio::net::UnixListener;
+    /// use std::os::unix::net::UnixListener as StdUnixListener;
+    /// # use std::error::Error;
+    ///
+    /// # async fn dox() -> Result<(), Box<dyn Error>> {
+    /// let std_listener = StdUnixListener::bind("/path/to/the/socket")?;
+    /// std_listener.set_nonblocking(true)?;
+    /// let listener = UnixListener::from_std(std_listener)?;
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
     /// # Panics
     ///
@@ -95,20 +141,18 @@ impl UnixListener {
     /// Turns a [`tokio::net::UnixListener`] into a [`std::os::unix::net::UnixListener`].
     ///
     /// The returned [`std::os::unix::net::UnixListener`] will have nonblocking mode
-    /// set as `true`.  Use [`set_nonblocking`] to change the blocking mode if needed.
+    /// set as `true`. Use [`set_nonblocking`] to change the blocking mode if needed.
     ///
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use std::error::Error;
-    ///
-    /// #[tokio::main]
-    /// async fn main() -> Result<(), Box<dyn Error>> {
-    ///     let tokio_listener = tokio::net::UnixListener::bind("127.0.0.1:0")?;
-    ///     let std_listener = tokio_listener.into_std()?;
-    ///     std_listener.set_nonblocking(false)?;
-    ///     Ok(())
-    /// }
+    /// # use std::error::Error;
+    /// # async fn dox() -> Result<(), Box<dyn Error>> {
+    /// let tokio_listener = tokio::net::UnixListener::bind("/path/to/the/socket")?;
+    /// let std_listener = tokio_listener.into_std()?;
+    /// std_listener.set_nonblocking(false)?;
+    /// # Ok(())
+    /// # }
     /// ```
     ///
     /// [`tokio::net::UnixListener`]: UnixListener
@@ -117,7 +161,7 @@ impl UnixListener {
     pub fn into_std(self) -> io::Result<std::os::unix::net::UnixListener> {
         self.io
             .into_inner()
-            .map(|io| io.into_raw_fd())
+            .map(IntoRawFd::into_raw_fd)
             .map(|raw_fd| unsafe { net::UnixListener::from_raw_fd(raw_fd) })
     }
 
@@ -186,5 +230,11 @@ impl fmt::Debug for UnixListener {
 impl AsRawFd for UnixListener {
     fn as_raw_fd(&self) -> RawFd {
         self.io.as_raw_fd()
+    }
+}
+
+impl AsFd for UnixListener {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        unsafe { BorrowedFd::borrow_raw(self.as_raw_fd()) }
     }
 }
