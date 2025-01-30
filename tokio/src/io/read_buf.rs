@@ -39,9 +39,11 @@ impl<'a> ReadBuf<'a> {
         }
     }
 
-    /// Creates a new `ReadBuf` from a fully uninitialized buffer.
+    /// Creates a new `ReadBuf` from a buffer that may be uninitialized.
     ///
-    /// Use `assume_init` if part of the buffer is known to be already initialized.
+    /// The internal cursor will mark the entire buffer as uninitialized. If
+    /// the buffer is known to be partially initialized, then use `assume_init`
+    /// to move the internal cursor.
     #[inline]
     pub fn uninit(buf: &'a mut [MaybeUninit<u8>]) -> ReadBuf<'a> {
         ReadBuf {
@@ -248,7 +250,9 @@ impl<'a> ReadBuf<'a> {
     pub fn put_slice(&mut self, buf: &[u8]) {
         assert!(
             self.remaining() >= buf.len(),
-            "buf.len() must fit in remaining()"
+            "buf.len() must fit in remaining(); buf.len() = {}, remaining() = {}",
+            buf.len(),
+            self.remaining()
         );
 
         let amt = buf.len();
@@ -267,6 +271,33 @@ impl<'a> ReadBuf<'a> {
             self.initialized = end;
         }
         self.filled = end;
+    }
+}
+
+#[cfg(feature = "io-util")]
+#[cfg_attr(docsrs, doc(cfg(feature = "io-util")))]
+unsafe impl<'a> bytes::BufMut for ReadBuf<'a> {
+    fn remaining_mut(&self) -> usize {
+        self.remaining()
+    }
+
+    // SAFETY: The caller guarantees that at least `cnt` unfilled bytes have been initialized.
+    unsafe fn advance_mut(&mut self, cnt: usize) {
+        self.assume_init(cnt);
+        self.advance(cnt);
+    }
+
+    fn chunk_mut(&mut self) -> &mut bytes::buf::UninitSlice {
+        // SAFETY: No region of `unfilled` will be deinitialized because it is
+        // exposed as an `UninitSlice`, whose API guarantees that the memory is
+        // never deinitialized.
+        let unfilled = unsafe { self.unfilled_mut() };
+        let len = unfilled.len();
+        let ptr = unfilled.as_mut_ptr() as *mut u8;
+
+        // SAFETY: The pointer is valid for `len` bytes because it comes from a
+        // slice of that length.
+        unsafe { bytes::buf::UninitSlice::from_raw_parts_mut(ptr, len) }
     }
 }
 

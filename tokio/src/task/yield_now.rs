@@ -1,6 +1,8 @@
+use crate::runtime::context;
+
 use std::future::Future;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{ready, Context, Poll};
 
 /// Yields execution back to the Tokio runtime.
 ///
@@ -44,15 +46,19 @@ pub async fn yield_now() {
         type Output = ();
 
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            ready!(crate::trace::trace_leaf(cx));
+
             if self.yielded {
                 return Poll::Ready(());
             }
 
             self.yielded = true;
-            cx.waker().wake_by_ref();
+
+            context::defer(cx.waker());
+
             Poll::Pending
         }
     }
 
-    YieldNow { yielded: false }.await
+    YieldNow { yielded: false }.await;
 }

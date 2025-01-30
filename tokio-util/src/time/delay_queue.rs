@@ -6,7 +6,6 @@
 
 use crate::time::wheel::{self, Wheel};
 
-use futures_core::ready;
 use tokio::time::{sleep_until, Duration, Instant, Sleep};
 
 use core::ops::{Index, IndexMut};
@@ -19,7 +18,7 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::task::{self, Poll, Waker};
+use std::task::{self, ready, Poll, Waker};
 
 /// A queue of delayed elements.
 ///
@@ -62,7 +61,7 @@ use std::task::{self, Poll, Waker};
 /// performance and scalability benefits.
 ///
 /// State associated with each entry is stored in a [`slab`]. This amortizes the cost of allocation,
-/// and allows reuse of the memory allocated for expired entires.
+/// and allows reuse of the memory allocated for expired entries.
 ///
 /// Capacity can be checked using [`capacity`] and allocated preemptively by using
 /// the [`reserve`] method.
@@ -74,9 +73,8 @@ use std::task::{self, Poll, Waker};
 /// ```rust,no_run
 /// use tokio_util::time::{DelayQueue, delay_queue};
 ///
-/// use futures::ready;
 /// use std::collections::HashMap;
-/// use std::task::{Context, Poll};
+/// use std::task::{ready, Context, Poll};
 /// use std::time::Duration;
 /// # type CacheKey = String;
 /// # type Value = String;
@@ -275,7 +273,7 @@ impl<T> SlabStorage<T> {
     fn remap_key(&self, key: &Key) -> Option<KeyInternal> {
         let key_map = &self.key_map;
         if self.compact_called {
-            key_map.get(&*key).copied()
+            key_map.get(key).copied()
         } else {
             Some((*key).into())
         }
@@ -667,8 +665,41 @@ impl<T> DelayQueue<T> {
                 // The delay is already expired, store it in the expired queue
                 self.expired.push(key, &mut self.slab);
             }
-            Err((_, err)) => panic!("invalid deadline; err={:?}", err),
+            Err((_, err)) => panic!("invalid deadline; err={err:?}"),
         }
+    }
+
+    /// Returns the deadline of the item associated with `key`.
+    ///
+    /// Since the queue operates at millisecond granularity, the returned
+    /// deadline may not exactly match the value that was given when initially
+    /// inserting the item into the queue.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if `key` is not contained by the queue.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage
+    ///
+    /// ```rust
+    /// use tokio_util::time::DelayQueue;
+    /// use std::time::Duration;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let mut delay_queue = DelayQueue::new();
+    ///
+    /// let key1 = delay_queue.insert("foo", Duration::from_secs(5));
+    /// let key2 = delay_queue.insert("bar", Duration::from_secs(10));
+    ///
+    /// assert!(delay_queue.deadline(&key1) < delay_queue.deadline(&key2));
+    /// # }
+    /// ```
+    #[track_caller]
+    pub fn deadline(&self, key: &Key) -> Instant {
+        self.start + Duration::from_millis(self.slab[*key].when)
     }
 
     /// Removes the key from the expired queue or the timer wheel
@@ -733,10 +764,53 @@ impl<T> DelayQueue<T> {
             }
         }
 
+        if self.slab.is_empty() {
+            if let Some(waker) = self.waker.take() {
+                waker.wake();
+            }
+        }
+
         Expired {
             key: Key::new(key.index),
             data: data.inner,
             deadline: self.start + Duration::from_millis(data.when),
+        }
+    }
+
+    /// Attempts to remove the item associated with `key` from the queue.
+    ///
+    /// Removes the item associated with `key`, and returns it along with the
+    /// `Instant` at which it would have expired, if it exists.
+    ///
+    /// Returns `None` if `key` is not in the queue.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage
+    ///
+    /// ```rust
+    /// use tokio_util::time::DelayQueue;
+    /// use std::time::Duration;
+    ///
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() {
+    /// let mut delay_queue = DelayQueue::new();
+    /// let key = delay_queue.insert("foo", Duration::from_secs(5));
+    ///
+    /// // The item is in the queue, `try_remove` returns `Some(Expired("foo"))`.
+    /// let item = delay_queue.try_remove(&key);
+    /// assert_eq!(item.unwrap().into_inner(), "foo");
+    ///
+    /// // The item is not in the queue anymore, `try_remove` returns `None`.
+    /// let item = delay_queue.try_remove(&key);
+    /// assert!(item.is_none());
+    /// # }
+    /// ```
+    pub fn try_remove(&mut self, key: &Key) -> Option<Expired<T>> {
+        if self.slab.contains(key) {
+            Some(self.remove(key))
+        } else {
+            None
         }
     }
 
@@ -837,8 +911,45 @@ impl<T> DelayQueue<T> {
         self.slab.compact();
     }
 
-    /// Returns the next time to poll as determined by the wheel
-    fn next_deadline(&mut self) -> Option<Instant> {
+    /// Gets the [`Key`] that [`poll_expired`] will pull out of the queue next, without
+    /// pulling it out or waiting for the deadline to expire.
+    ///
+    /// Entries that have already expired may be returned in any order, but it is
+    /// guaranteed that this method returns them in the same order as when items
+    /// are popped from the `DelayQueue`.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage
+    ///
+    /// ```rust
+    /// use tokio_util::time::DelayQueue;
+    /// use std::time::Duration;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let mut delay_queue = DelayQueue::new();
+    ///
+    /// let key1 = delay_queue.insert("foo", Duration::from_secs(10));
+    /// let key2 = delay_queue.insert("bar", Duration::from_secs(5));
+    /// let key3 = delay_queue.insert("baz", Duration::from_secs(15));
+    ///
+    /// assert_eq!(delay_queue.peek().unwrap(), key2);
+    /// # }
+    /// ```
+    ///
+    /// [`Key`]: struct@Key
+    /// [`poll_expired`]: method@Self::poll_expired
+    pub fn peek(&self) -> Option<Key> {
+        use self::wheel::Stack;
+
+        self.expired.peek().or_else(|| self.wheel.peek())
+    }
+
+    /// Returns the next time to poll as determined by the wheel.
+    ///
+    /// Note that this does not include deadlines in the `expired` queue.
+    fn next_deadline(&self) -> Option<Instant> {
         self.wheel
             .poll_at()
             .map(|poll_at| self.start + Duration::from_millis(poll_at))
@@ -1127,6 +1238,10 @@ impl<T> wheel::Stack for Stack<T> {
         } else {
             None
         }
+    }
+
+    fn peek(&self) -> Option<Self::Owned> {
+        self.head
     }
 
     #[track_caller]

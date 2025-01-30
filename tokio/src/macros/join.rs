@@ -1,60 +1,72 @@
-/// Waits on multiple concurrent branches, returning when **all** branches
-/// complete.
-///
-/// The `join!` macro must be used inside of async functions, closures, and
-/// blocks.
-///
-/// The `join!` macro takes a list of async expressions and evaluates them
-/// concurrently on the same task. Each async expression evaluates to a future
-/// and the futures from each expression are multiplexed on the current task.
-///
-/// When working with async expressions returning `Result`, `join!` will wait
-/// for **all** branches complete regardless if any complete with `Err`. Use
-/// [`try_join!`] to return early when `Err` is encountered.
-///
-/// [`try_join!`]: crate::try_join
-///
-/// # Notes
-///
-/// The supplied futures are stored inline and does not require allocating a
-/// `Vec`.
-///
-/// ### Runtime characteristics
-///
-/// By running all async expressions on the current task, the expressions are
-/// able to run **concurrently** but not in **parallel**. This means all
-/// expressions are run on the same thread and if one branch blocks the thread,
-/// all other expressions will be unable to continue. If parallelism is
-/// required, spawn each async expression using [`tokio::spawn`] and pass the
-/// join handle to `join!`.
-///
-/// [`tokio::spawn`]: crate::spawn
-///
-/// # Examples
-///
-/// Basic join with two branches
-///
-/// ```
-/// async fn do_stuff_async() {
-///     // async work
-/// }
-///
-/// async fn more_async_work() {
-///     // more here
-/// }
-///
-/// #[tokio::main]
-/// async fn main() {
-///     let (first, second) = tokio::join!(
-///         do_stuff_async(),
-///         more_async_work());
-///
-///     // do something with the values
-/// }
-/// ```
-#[macro_export]
-#[cfg_attr(docsrs, doc(cfg(feature = "macros")))]
-macro_rules! join {
+macro_rules! doc {
+    ($join:item) => {
+        /// Waits on multiple concurrent branches, returning when **all** branches
+        /// complete.
+        ///
+        /// The `join!` macro must be used inside of async functions, closures, and
+        /// blocks.
+        ///
+        /// The `join!` macro takes a list of async expressions and evaluates them
+        /// concurrently on the same task. Each async expression evaluates to a future
+        /// and the futures from each expression are multiplexed on the current task.
+        ///
+        /// When working with async expressions returning `Result`, `join!` will wait
+        /// for **all** branches complete regardless if any complete with `Err`. Use
+        /// [`try_join!`] to return early when `Err` is encountered.
+        ///
+        /// [`try_join!`]: crate::try_join
+        ///
+        /// # Notes
+        ///
+        /// The supplied futures are stored inline and do not require allocating a
+        /// `Vec`.
+        ///
+        /// ### Runtime characteristics
+        ///
+        /// By running all async expressions on the current task, the expressions are
+        /// able to run **concurrently** but not in **parallel**. This means all
+        /// expressions are run on the same thread and if one branch blocks the thread,
+        /// all other expressions will be unable to continue. If parallelism is
+        /// required, spawn each async expression using [`tokio::spawn`] and pass the
+        /// join handle to `join!`.
+        ///
+        /// [`tokio::spawn`]: crate::spawn
+        ///
+        /// # Examples
+        ///
+        /// Basic join with two branches
+        ///
+        /// ```
+        /// async fn do_stuff_async() {
+        ///     // async work
+        /// }
+        ///
+        /// async fn more_async_work() {
+        ///     // more here
+        /// }
+        ///
+        /// #[tokio::main]
+        /// async fn main() {
+        ///     let (first, second) = tokio::join!(
+        ///         do_stuff_async(),
+        ///         more_async_work());
+        ///
+        ///     // do something with the values
+        /// }
+        /// ```
+        #[macro_export]
+        #[cfg_attr(docsrs, doc(cfg(feature = "macros")))]
+        $join
+    };
+}
+
+#[cfg(doc)]
+doc! {macro_rules! join {
+    ($($future:expr),*) => { unimplemented!() }
+}}
+
+#[cfg(not(doc))]
+doc! {macro_rules! join {
     (@ {
         // One `_` for each branch in the `join!` macro. This is not used once
         // normalization is complete.
@@ -72,7 +84,17 @@ macro_rules! join {
 
         // Safety: nothing must be moved out of `futures`. This is to satisfy
         // the requirement of `Pin::new_unchecked` called below.
+        //
+        // We can't use the `pin!` macro for this because `futures` is a tuple
+        // and the standard library provides no way to pin-project to the fields
+        // of a tuple.
         let mut futures = ( $( maybe_done($e), )* );
+
+        // This assignment makes sure that the `poll_fn` closure only has a
+        // reference to the futures, instead of taking ownership of them. This
+        // mitigates the issue described in
+        // <https://internals.rust-lang.org/t/surprising-soundness-trouble-around-pollfn/17484>
+        let mut futures = &mut futures;
 
         // Each time the future created by poll_fn is polled, a different future will be polled first
         // to ensure every future passed to join! gets a chance to make progress even if
@@ -106,7 +128,7 @@ macro_rules! join {
                     to_run -= 1;
 
                     // Extract the future for this branch from the tuple.
-                    let ( $($skip,)* fut, .. ) = &mut futures;
+                    let ( $($skip,)* fut, .. ) = &mut *futures;
 
                     // Safety: future is stored on the stack above
                     // and never moved.
@@ -148,7 +170,9 @@ macro_rules! join {
 
     // ===== Entry point =====
 
-    ( $($e:expr),* $(,)?) => {
+    ( $($e:expr),+ $(,)?) => {
         $crate::join!(@{ () (0) } $($e,)*)
     };
-}
+
+    () => { async {}.await }
+}}

@@ -12,6 +12,10 @@
 //! Since the `send` method is not async, it can be used anywhere. This includes
 //! sending between two runtimes, and using it from non-async code.
 //!
+//! If the [`Receiver`] is closed before receiving a message which has already
+//! been sent, the message will remain in the channel until the receiver is
+//! dropped, at which point the message will be dropped immediately.
+//!
 //! # Examples
 //!
 //! ```
@@ -55,7 +59,7 @@
 //! }
 //! ```
 //!
-//! To use a oneshot channel in a `tokio::select!` loop, add `&mut` in front of
+//! To use a `oneshot` channel in a `tokio::select!` loop, add `&mut` in front of
 //! the channel.
 //!
 //! ```
@@ -131,7 +135,7 @@ use std::mem::MaybeUninit;
 use std::pin::Pin;
 use std::sync::atomic::Ordering::{self, AcqRel, Acquire};
 use std::task::Poll::{Pending, Ready};
-use std::task::{Context, Poll, Waker};
+use std::task::{ready, Context, Poll, Waker};
 
 /// Sends a value to the associated [`Receiver`].
 ///
@@ -227,7 +231,7 @@ pub struct Sender<T> {
 /// [`channel`](fn@channel) function.
 ///
 /// This channel has no `recv` method because the receiver itself implements the
-/// [`Future`] trait. To receive a value, `.await` the `Receiver` object directly.
+/// [`Future`] trait. To receive a `Result<T, `[`error::RecvError`]`>`, `.await` the `Receiver` object directly.
 ///
 /// The `poll` method on the `Future` trait is allowed to spuriously return
 /// `Poll::Pending` even if the message has been sent. If such a spurious
@@ -326,11 +330,13 @@ pub struct Receiver<T> {
 }
 
 pub mod error {
-    //! Oneshot error types.
+    //! `Oneshot` error types.
 
     use std::fmt;
 
     /// Error returned by the `Future` implementation for `Receiver`.
+    ///
+    /// This error is returned by the receiver when the sender is dropped without sending.
     #[derive(Debug, Eq, PartialEq, Clone)]
     pub struct RecvError(pub(super) ());
 
@@ -407,21 +413,21 @@ impl Task {
         F: FnOnce(&Waker) -> R,
     {
         self.0.with(|ptr| {
-            let waker: *const Waker = (&*ptr).as_ptr();
+            let waker: *const Waker = (*ptr).as_ptr();
             f(&*waker)
         })
     }
 
     unsafe fn drop_task(&self) {
         self.0.with_mut(|ptr| {
-            let ptr: *mut Waker = (&mut *ptr).as_mut_ptr();
+            let ptr: *mut Waker = (*ptr).as_mut_ptr();
             ptr.drop_in_place();
         });
     }
 
     unsafe fn set_task(&self, cx: &mut Context<'_>) {
         self.0.with_mut(|ptr| {
-            let ptr: *mut Waker = (&mut *ptr).as_mut_ptr();
+            let ptr: *mut Waker = (*ptr).as_mut_ptr();
             ptr.write(cx.waker().clone());
         });
     }
@@ -467,6 +473,7 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
         let location = std::panic::Location::caller();
 
         let resource_span = tracing::trace_span!(
+            parent: None,
             "runtime.resource",
             concrete_type = "Sender|Receiver",
             kind = "Sync",
@@ -548,8 +555,8 @@ impl<T> Sender<T> {
     /// Attempts to send a value on this channel, returning it back if it could
     /// not be sent.
     ///
-    /// This method consumes `self` as only one value may ever be sent on a oneshot
-    /// channel. It is not marked async because sending a message to an oneshot
+    /// This method consumes `self` as only one value may ever be sent on a `oneshot`
+    /// channel. It is not marked async because sending a message to an `oneshot`
     /// channel never requires any form of waiting.  Because of this, the `send`
     /// method can be used in both synchronous and asynchronous code without
     /// problems.
@@ -691,7 +698,7 @@ impl<T> Sender<T> {
     /// }
     /// ```
     pub async fn closed(&mut self) {
-        use crate::future::poll_fn;
+        use std::future::poll_fn;
 
         #[cfg(all(tokio_unstable, feature = "tracing"))]
         let resource_span = self.resource_span.clone();
@@ -706,7 +713,7 @@ impl<T> Sender<T> {
         #[cfg(not(all(tokio_unstable, feature = "tracing")))]
         let closed = poll_fn(|cx| self.poll_closed(cx));
 
-        closed.await
+        closed.await;
     }
 
     /// Returns `true` if the associated [`Receiver`] handle has been dropped.
@@ -743,7 +750,7 @@ impl<T> Sender<T> {
         state.is_closed()
     }
 
-    /// Checks whether the oneshot channel has been closed, and if not, schedules the
+    /// Checks whether the `oneshot` channel has been closed, and if not, schedules the
     /// `Waker` in the provided `Context` to receive a notification when the channel is
     /// closed.
     ///
@@ -768,7 +775,7 @@ impl<T> Sender<T> {
     /// ```
     /// use tokio::sync::oneshot;
     ///
-    /// use futures::future::poll_fn;
+    /// use std::future::poll_fn;
     ///
     /// #[tokio::main]
     /// async fn main() {
@@ -784,8 +791,10 @@ impl<T> Sender<T> {
     /// }
     /// ```
     pub fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        ready!(crate::trace::trace_leaf(cx));
+
         // Keep track of task budget
-        let coop = ready!(crate::coop::poll_proceed(cx));
+        let coop = ready!(crate::runtime::coop::poll_proceed(cx));
 
         let inner = self.inner.as_ref().unwrap();
 
@@ -793,7 +802,7 @@ impl<T> Sender<T> {
 
         if state.is_closed() {
             coop.made_progress();
-            return Poll::Ready(());
+            return Ready(());
         }
 
         if state.is_tx_task_set() {
@@ -1054,6 +1063,7 @@ impl<T> Receiver<T> {
     /// ```
     #[track_caller]
     #[cfg(feature = "sync")]
+    #[cfg_attr(docsrs, doc(alias = "recv_blocking"))]
     pub fn blocking_recv(self) -> Result<T, RecvError> {
         crate::future::block_on(self)
     }
@@ -1062,7 +1072,14 @@ impl<T> Receiver<T> {
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         if let Some(inner) = self.inner.as_ref() {
-            inner.close();
+            let state = inner.close();
+
+            if state.is_complete() {
+                // SAFETY: we have ensured that the `VALUE_SENT` bit has been set,
+                // so only the receiver can access the value.
+                drop(unsafe { inner.consume_value() });
+            }
+
             #[cfg(all(tokio_unstable, feature = "tracing"))]
             self.resource_span.in_scope(|| {
                 tracing::trace!(
@@ -1123,8 +1140,9 @@ impl<T> Inner<T> {
     }
 
     fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<Result<T, RecvError>> {
+        ready!(crate::trace::trace_leaf(cx));
         // Keep track of task budget
-        let coop = ready!(crate::coop::poll_proceed(cx));
+        let coop = ready!(crate::runtime::coop::poll_proceed(cx));
 
         // Load the state
         let mut state = State::load(&self.state, Acquire);
@@ -1191,7 +1209,7 @@ impl<T> Inner<T> {
     }
 
     /// Called by `Receiver` to indicate that the value will never be received.
-    fn close(&self) {
+    fn close(&self) -> State {
         let prev = State::set_closed(&self.state);
 
         if prev.is_tx_task_set() && !prev.is_complete() {
@@ -1199,6 +1217,8 @@ impl<T> Inner<T> {
                 self.tx_task.with_task(Waker::wake_by_ref);
             }
         }
+
+        prev
     }
 
     /// Consumes the value. This function does not check `state`.
@@ -1236,6 +1256,15 @@ impl<T> Drop for Inner<T> {
             unsafe {
                 self.tx_task.drop_task();
             }
+        }
+
+        // SAFETY: we have `&mut self`, and therefore we have
+        // exclusive access to the value.
+        unsafe {
+            // Note: the assertion holds because if the value has been sent by sender,
+            // we must ensure that the value must have been consumed by the receiver before
+            // dropping the `Inner`.
+            debug_assert!(self.consume_value().is_none());
         }
     }
 }

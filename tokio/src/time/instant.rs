@@ -116,7 +116,7 @@ impl Instant {
     }
 
     /// Returns the amount of time elapsed since this instant was created,
-    /// or zero duration if that this instant is in the future.
+    /// or zero duration if this instant is in the future.
     ///
     /// # Examples
     ///
@@ -188,7 +188,7 @@ impl ops::Sub<Duration> for Instant {
     type Output = Instant;
 
     fn sub(self, rhs: Duration) -> Instant {
-        Instant::from_std(self.std - rhs)
+        Instant::from_std(std::time::Instant::sub(self.std, rhs))
     }
 }
 

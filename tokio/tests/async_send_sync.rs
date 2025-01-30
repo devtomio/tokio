@@ -14,16 +14,19 @@ use tokio::time::{Duration, Instant};
 // The names of these structs behaves better when sorted.
 // Send: Yes, Sync: Yes
 #[derive(Clone)]
+#[allow(unused)]
 struct YY {}
 
 // Send: Yes, Sync: No
 #[derive(Clone)]
+#[allow(unused)]
 struct YN {
     _value: Cell<u8>,
 }
 
 // Send: No, Sync: No
 #[derive(Clone)]
+#[allow(unused)]
 struct NN {
     _value: Rc<u8>,
 }
@@ -52,18 +55,21 @@ fn require_unpin<T: Unpin>(_t: &T) {}
 #[allow(dead_code)]
 struct Invalid;
 
+#[allow(unused)]
 trait AmbiguousIfSend<A> {
     fn some_item(&self) {}
 }
 impl<T: ?Sized> AmbiguousIfSend<()> for T {}
 impl<T: ?Sized + Send> AmbiguousIfSend<Invalid> for T {}
 
+#[allow(unused)]
 trait AmbiguousIfSync<A> {
     fn some_item(&self) {}
 }
 impl<T: ?Sized> AmbiguousIfSync<()> for T {}
 impl<T: ?Sized + Sync> AmbiguousIfSync<Invalid> for T {}
 
+#[allow(unused)]
 trait AmbiguousIfUnpin<A> {
     fn some_item(&self) {}
 }
@@ -130,11 +136,26 @@ macro_rules! assert_value {
 macro_rules! cfg_not_wasi {
     ($($item:item)*) => {
         $(
-            #[cfg(not(tokio_wasi))]
+            #[cfg(not(target_os = "wasi"))]
             $item
         )*
     }
 }
+
+// Manually re-implementation of `async_assert_fn` for `poll_fn`. The macro
+// doesn't work for this particular case because constructing the closure
+// is too complicated.
+const _: fn() = || {
+    let pinned = std::marker::PhantomPinned;
+    let f = tokio::macros::support::poll_fn(move |_| {
+        // Use `pinned` to take ownership of it.
+        let _ = &pinned;
+        std::task::Poll::Pending::<()>
+    });
+    require_send(&f);
+    require_sync(&f);
+    AmbiguousIfUnpin::some_item(&f);
+};
 
 cfg_not_wasi! {
     mod fs {
@@ -248,6 +269,19 @@ mod unix_datagram {
     async_assert_fn!(UnixStream::writable(_): Send & Sync & !Unpin);
 }
 
+#[cfg(unix)]
+mod unix_pipe {
+    use super::*;
+    use tokio::net::unix::pipe::*;
+    assert_value!(OpenOptions: Send & Sync & Unpin);
+    assert_value!(Receiver: Send & Sync & Unpin);
+    assert_value!(Sender: Send & Sync & Unpin);
+    async_assert_fn!(Receiver::readable(_): Send & Sync & !Unpin);
+    async_assert_fn!(Receiver::ready(_, tokio::io::Interest): Send & Sync & !Unpin);
+    async_assert_fn!(Sender::ready(_, tokio::io::Interest): Send & Sync & !Unpin);
+    async_assert_fn!(Sender::writable(_): Send & Sync & !Unpin);
+}
+
 #[cfg(windows)]
 mod windows_named_pipe {
     use super::*;
@@ -319,6 +353,15 @@ assert_value!(tokio::sync::OnceCell<YY>: Send & Sync & Unpin);
 assert_value!(tokio::sync::OwnedMutexGuard<NN>: !Send & !Sync & Unpin);
 assert_value!(tokio::sync::OwnedMutexGuard<YN>: Send & !Sync & Unpin);
 assert_value!(tokio::sync::OwnedMutexGuard<YY>: Send & Sync & Unpin);
+assert_value!(tokio::sync::OwnedMappedMutexGuard<NN,NN>: !Send & !Sync & Unpin);
+assert_value!(tokio::sync::OwnedMappedMutexGuard<NN,YN>: !Send & !Sync & Unpin);
+assert_value!(tokio::sync::OwnedMappedMutexGuard<NN,YY>: !Send & !Sync & Unpin);
+assert_value!(tokio::sync::OwnedMappedMutexGuard<YN,NN>: !Send & !Sync & Unpin);
+assert_value!(tokio::sync::OwnedMappedMutexGuard<YN,YN>: Send & !Sync & Unpin);
+assert_value!(tokio::sync::OwnedMappedMutexGuard<YN,YY>: Send & !Sync & Unpin);
+assert_value!(tokio::sync::OwnedMappedMutexGuard<YY,NN>: !Send & !Sync & Unpin);
+assert_value!(tokio::sync::OwnedMappedMutexGuard<YY,YN>: Send & !Sync & Unpin);
+assert_value!(tokio::sync::OwnedMappedMutexGuard<YY,YY>: Send & Sync & Unpin);
 assert_value!(tokio::sync::OwnedRwLockMappedWriteGuard<NN>: !Send & !Sync & Unpin);
 assert_value!(tokio::sync::OwnedRwLockMappedWriteGuard<YN>: !Send & !Sync & Unpin);
 assert_value!(tokio::sync::OwnedRwLockMappedWriteGuard<YY>: Send & Sync & Unpin);
@@ -370,6 +413,12 @@ assert_value!(tokio::sync::mpsc::UnboundedReceiver<YY>: Send & Sync & Unpin);
 assert_value!(tokio::sync::mpsc::UnboundedSender<NN>: !Send & !Sync & Unpin);
 assert_value!(tokio::sync::mpsc::UnboundedSender<YN>: Send & Sync & Unpin);
 assert_value!(tokio::sync::mpsc::UnboundedSender<YY>: Send & Sync & Unpin);
+assert_value!(tokio::sync::mpsc::WeakSender<NN>: !Send & !Sync & Unpin);
+assert_value!(tokio::sync::mpsc::WeakSender<YN>: Send & Sync & Unpin);
+assert_value!(tokio::sync::mpsc::WeakSender<YY>: Send & Sync & Unpin);
+assert_value!(tokio::sync::mpsc::WeakUnboundedSender<NN>: !Send & !Sync & Unpin);
+assert_value!(tokio::sync::mpsc::WeakUnboundedSender<YN>: Send & Sync & Unpin);
+assert_value!(tokio::sync::mpsc::WeakUnboundedSender<YY>: Send & Sync & Unpin);
 assert_value!(tokio::sync::mpsc::error::SendError<NN>: !Send & !Sync & Unpin);
 assert_value!(tokio::sync::mpsc::error::SendError<YN>: Send & !Sync & Unpin);
 assert_value!(tokio::sync::mpsc::error::SendError<YY>: Send & Sync & Unpin);
@@ -394,6 +443,14 @@ assert_value!(tokio::sync::watch::Ref<'_, YY>: !Send & Sync & Unpin);
 assert_value!(tokio::sync::watch::Sender<NN>: !Send & !Sync & Unpin);
 assert_value!(tokio::sync::watch::Sender<YN>: !Send & !Sync & Unpin);
 assert_value!(tokio::sync::watch::Sender<YY>: Send & Sync & Unpin);
+assert_value!(tokio::task::JoinError: Send & Sync & Unpin);
+assert_value!(tokio::task::JoinHandle<NN>: !Send & !Sync & Unpin);
+assert_value!(tokio::task::JoinHandle<YN>: Send & Sync & Unpin);
+assert_value!(tokio::task::JoinHandle<YY>: Send & Sync & Unpin);
+assert_value!(tokio::task::JoinSet<NN>: !Send & !Sync & Unpin);
+assert_value!(tokio::task::JoinSet<YN>: Send & Sync & Unpin);
+assert_value!(tokio::task::JoinSet<YY>: Send & Sync & Unpin);
+assert_value!(tokio::task::LocalSet: !Send & !Sync & Unpin);
 async_assert_fn!(tokio::sync::Barrier::wait(_): Send & Sync & !Unpin);
 async_assert_fn!(tokio::sync::Mutex<NN>::lock(_): !Send & !Sync & !Unpin);
 async_assert_fn!(tokio::sync::Mutex<NN>::lock_owned(_): !Send & !Sync & !Unpin);
@@ -466,6 +523,12 @@ async_assert_fn!(tokio::sync::watch::Receiver<YY>::changed(_): Send & Sync & !Un
 async_assert_fn!(tokio::sync::watch::Sender<NN>::closed(_): !Send & !Sync & !Unpin);
 async_assert_fn!(tokio::sync::watch::Sender<YN>::closed(_): !Send & !Sync & !Unpin);
 async_assert_fn!(tokio::sync::watch::Sender<YY>::closed(_): Send & Sync & !Unpin);
+async_assert_fn!(tokio::task::JoinSet<Cell<u32>>::join_next(_): Send & Sync & !Unpin);
+async_assert_fn!(tokio::task::JoinSet<Cell<u32>>::shutdown(_): Send & Sync & !Unpin);
+async_assert_fn!(tokio::task::JoinSet<Rc<u32>>::join_next(_): !Send & !Sync & !Unpin);
+async_assert_fn!(tokio::task::JoinSet<Rc<u32>>::shutdown(_): !Send & !Sync & !Unpin);
+async_assert_fn!(tokio::task::JoinSet<u32>::join_next(_): Send & Sync & !Unpin);
+async_assert_fn!(tokio::task::JoinSet<u32>::shutdown(_): Send & Sync & !Unpin);
 async_assert_fn!(tokio::task::LocalKey<Cell<u32>>::scope(_, Cell<u32>, BoxFuture<()>): !Send & !Sync & !Unpin);
 async_assert_fn!(tokio::task::LocalKey<Cell<u32>>::scope(_, Cell<u32>, BoxFutureSend<()>): Send & !Sync & !Unpin);
 async_assert_fn!(tokio::task::LocalKey<Cell<u32>>::scope(_, Cell<u32>, BoxFutureSync<()>): Send & !Sync & !Unpin);
@@ -479,27 +542,9 @@ async_assert_fn!(tokio::task::LocalSet::run_until(_, BoxFutureSync<()>): !Send &
 async_assert_fn!(tokio::task::unconstrained(BoxFuture<()>): !Send & !Sync & Unpin);
 async_assert_fn!(tokio::task::unconstrained(BoxFutureSend<()>): Send & !Sync & Unpin);
 async_assert_fn!(tokio::task::unconstrained(BoxFutureSync<()>): Send & Sync & Unpin);
-assert_value!(tokio::task::JoinError: Send & Sync & Unpin);
-assert_value!(tokio::task::JoinHandle<NN>: !Send & !Sync & Unpin);
-assert_value!(tokio::task::JoinHandle<YN>: Send & Sync & Unpin);
-assert_value!(tokio::task::JoinHandle<YY>: Send & Sync & Unpin);
-#[cfg(tokio_unstable)]
-mod unstable {
-    use super::*;
-    async_assert_fn!(tokio::task::JoinSet<Cell<u32>>::join_next(_): Send & Sync & !Unpin);
-    async_assert_fn!(tokio::task::JoinSet<Cell<u32>>::shutdown(_): Send & Sync & !Unpin);
-    async_assert_fn!(tokio::task::JoinSet<Rc<u32>>::join_next(_): !Send & !Sync & !Unpin);
-    async_assert_fn!(tokio::task::JoinSet<Rc<u32>>::shutdown(_): !Send & !Sync & !Unpin);
-    async_assert_fn!(tokio::task::JoinSet<u32>::join_next(_): Send & Sync & !Unpin);
-    async_assert_fn!(tokio::task::JoinSet<u32>::shutdown(_): Send & Sync & !Unpin);
-    assert_value!(tokio::task::JoinSet<YY>: Send & Sync & Unpin);
-    assert_value!(tokio::task::JoinSet<YN>: Send & Sync & Unpin);
-    assert_value!(tokio::task::JoinSet<NN>: !Send & !Sync & Unpin);
-    assert_value!(tokio::task::LocalSet: !Send & !Sync & Unpin);
-}
 
 assert_value!(tokio::runtime::Builder: Send & Sync & Unpin);
-assert_value!(tokio::runtime::EnterGuard<'_>: Send & Sync & Unpin);
+assert_value!(tokio::runtime::EnterGuard<'_>: !Send & Sync & Unpin);
 assert_value!(tokio::runtime::Handle: Send & Sync & Unpin);
 assert_value!(tokio::runtime::Runtime: Send & Sync & Unpin);
 
@@ -679,6 +724,7 @@ mod unix_asyncfd {
     use super::*;
     use tokio::io::unix::*;
 
+    #[allow(unused)]
     struct ImplsFd<T> {
         _t: T,
     }

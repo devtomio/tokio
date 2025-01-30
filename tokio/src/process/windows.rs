@@ -24,20 +24,21 @@ use std::fmt;
 use std::fs::File as StdFile;
 use std::future::Future;
 use std::io;
-use std::os::windows::prelude::{AsRawHandle, IntoRawHandle, RawHandle};
+use std::os::windows::prelude::{AsRawHandle, IntoRawHandle, OwnedHandle, RawHandle};
 use std::pin::Pin;
 use std::process::Stdio;
 use std::process::{Child as StdChild, Command as StdCommand, ExitStatus};
-use std::ptr;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use winapi::shared::minwindef::{DWORD, FALSE};
-use winapi::um::handleapi::{DuplicateHandle, INVALID_HANDLE_VALUE};
-use winapi::um::processthreadsapi::GetCurrentProcess;
-use winapi::um::threadpoollegacyapiset::UnregisterWaitEx;
-use winapi::um::winbase::{RegisterWaitForSingleObject, INFINITE};
-use winapi::um::winnt::{
-    BOOLEAN, DUPLICATE_SAME_ACCESS, HANDLE, PVOID, WT_EXECUTEINWAITTHREAD, WT_EXECUTEONLYONCE,
+
+use windows_sys::{
+    Win32::Foundation::{
+        DuplicateHandle, BOOLEAN, DUPLICATE_SAME_ACCESS, HANDLE, INVALID_HANDLE_VALUE,
+    },
+    Win32::System::Threading::{
+        GetCurrentProcess, RegisterWaitForSingleObject, UnregisterWaitEx, INFINITE,
+        WT_EXECUTEINWAITTHREAD, WT_EXECUTEONLYONCE,
+    },
 };
 
 #[must_use = "futures do nothing unless polled"]
@@ -119,11 +120,11 @@ impl Future for Child {
             }
             let (tx, rx) = oneshot::channel();
             let ptr = Box::into_raw(Box::new(Some(tx)));
-            let mut wait_object = ptr::null_mut();
+            let mut wait_object = 0;
             let rc = unsafe {
                 RegisterWaitForSingleObject(
                     &mut wait_object,
-                    inner.child.as_raw_handle(),
+                    inner.child.as_raw_handle() as _,
                     Some(callback),
                     ptr as *mut _,
                     INFINITE,
@@ -162,7 +163,7 @@ impl Drop for Waiting {
     }
 }
 
-unsafe extern "system" fn callback(ptr: PVOID, _timer_fired: BOOLEAN) {
+unsafe extern "system" fn callback(ptr: *mut std::ffi::c_void, _timer_fired: BOOLEAN) {
     let complete = &mut *(ptr as *mut Option<oneshot::Sender<()>>);
     let _ = complete.take().unwrap().send(());
 }
@@ -192,6 +193,12 @@ pub(crate) struct ChildStdio {
     raw: Arc<StdFile>,
     // For doing I/O operations asynchronously
     io: Blocking<ArcFile>,
+}
+
+impl ChildStdio {
+    pub(super) fn into_owned_handle(self) -> io::Result<OwnedHandle> {
+        convert_to_file(self).map(OwnedHandle::from)
+    }
 }
 
 impl AsRawHandle for ChildStdio {
@@ -235,17 +242,23 @@ where
     use std::os::windows::prelude::FromRawHandle;
 
     let raw = Arc::new(unsafe { StdFile::from_raw_handle(io.into_raw_handle()) });
-    let io = Blocking::new(ArcFile(raw.clone()));
+    let io = ArcFile(raw.clone());
+    // SAFETY: the `Read` implementation of `io` does not
+    // read from the buffer it is borrowing and correctly
+    // reports the length of the data written into the buffer.
+    let io = unsafe { Blocking::new(io) };
     Ok(ChildStdio { raw, io })
 }
 
-pub(crate) fn convert_to_stdio(child_stdio: ChildStdio) -> io::Result<Stdio> {
+fn convert_to_file(child_stdio: ChildStdio) -> io::Result<StdFile> {
     let ChildStdio { raw, io } = child_stdio;
     drop(io); // Try to drop the Arc count here
 
-    Arc::try_unwrap(raw)
-        .or_else(|raw| duplicate_handle(&*raw))
-        .map(Stdio::from)
+    Arc::try_unwrap(raw).or_else(|raw| duplicate_handle(&*raw))
+}
+
+pub(crate) fn convert_to_stdio(child_stdio: ChildStdio) -> io::Result<Stdio> {
+    convert_to_file(child_stdio).map(Stdio::from)
 }
 
 fn duplicate_handle<T: AsRawHandle>(io: &T) -> io::Result<StdFile> {
@@ -257,11 +270,11 @@ fn duplicate_handle<T: AsRawHandle>(io: &T) -> io::Result<StdFile> {
 
         let status = DuplicateHandle(
             cur_proc,
-            io.as_raw_handle(),
+            io.as_raw_handle() as _,
             cur_proc,
             &mut dup_handle,
-            0 as DWORD,
-            FALSE,
+            0,
+            0,
             DUPLICATE_SAME_ACCESS,
         );
 
@@ -269,6 +282,6 @@ fn duplicate_handle<T: AsRawHandle>(io: &T) -> io::Result<StdFile> {
             return Err(io::Error::last_os_error());
         }
 
-        Ok(StdFile::from_raw_handle(dup_handle))
+        Ok(StdFile::from_raw_handle(dup_handle as _))
     }
 }
